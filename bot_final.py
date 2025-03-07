@@ -12,9 +12,8 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# -------------------------
-# Загрузка и проверка окружения
-# -------------------------
+# Установите pymorphy2: pip install pymorphy2
+import pymorphy2
 
 load_dotenv()
 
@@ -29,29 +28,14 @@ def check_env_vars() -> None:
 
 check_env_vars()
 
-# -------------------------
 # Инициализация LLM (Gemini)
-# -------------------------
-
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.0-flash")
 
-# -------------------------
-# Временное хранилище заданий (в памяти)
-# Формат: { "DD.MM.YYYY": [ {"subject": str, "task": str, "date": str}, ... ] }
-# -------------------------
-
+# Хранилище: { "DD.MM.YYYY": [ {"subject": str, "task": str, "date": str}, ... ] }
 homework_storage = {}
 
-# -------------------------
-# Вспомогательная функция
-# -------------------------
-
 async def ask_model_for_json(prompt: str) -> dict | None:
-    """
-    Шлёт prompt в модель, пытается распарсить ответ как JSON.
-    Возвращает dict или None при ошибке.
-    """
     try:
         response = model.generate_content(prompt)
         json_str = (
@@ -65,35 +49,38 @@ async def ask_model_for_json(prompt: str) -> dict | None:
         print(f"[ask_model_for_json] Ошибка парсинга ответа: {e}")
         return None
 
-# -------------------------
-# Функции «дочистки» для subject/date
-# -------------------------
-
+#
+# Функция «дочистки» (cleanup): убираем заведомо неверные subject ("задание" и т.п.),
+# и приводим название предмета к именительному падежу через pymorphy2.
+#
 def cleanup_subject_and_date(text: str, subject: str, date_str: str) -> tuple[str, str]:
-    """
-    1. Если LLM вернула subject == 'задание', 'задали' и т.п. (то есть явно некорректный предмет),
-       то обнуляем subject.
-    2. (Дополнительно можно сюда же добавить парсинг дней недели, если хотите.)
-    """
-    # На всякий случай
+    # 1) Убираем ошибки
     low_subj = subject.lower().strip()
-    if low_subj in ["задание", "задали", "что"]:
+    if low_subj in ["задание", "задали", "что", "домашнее", "дз"]:
         subject = ""
 
-    # Можно убрать пробелы
-    subject = subject.strip()
-    date_str = date_str.strip()
+    # 2) Приводим слова предмета к нормальной форме (если subject не пуст)
+    if subject:
+        morph = pymorphy2.MorphAnalyzer()
+        # Допустим, предмет может состоять из нескольких слов: "Высшая математика"
+        subj_parts = subject.split()
+        normalized_parts = []
+        for w in subj_parts:
+            parse = morph.parse(w)[0]
+            # Лемма (именительный падеж, ед. число) для прилагательных и существительных
+            normal_form = parse.normal_form  # "математика", "высший", "английский" и т.д.
+            normalized_parts.append(normal_form)
+        # Склеиваем обратно и ставим заглавную букву
+        subject = " ".join(normalized_parts).capitalize()
 
+    # Убираем лишние пробелы у date_str
+    date_str = date_str.strip()
     return subject, date_str
 
-# -------------------------
-# Парсинг запроса: add/get
-# -------------------------
-
+#
+# Определение интента: add / get
+#
 async def parse_query(text: str) -> str:
-    """
-    LLM говорит, что это "add" (добавить задание) или "get" (получить).
-    """
     prompt = f"""
 Определи, относится ли текст к добавлению задания ("add") или запросу заданий ("get").
 Ответ дай строго в JSON виде: {{"intent": ""}}
@@ -105,30 +92,23 @@ async def parse_query(text: str) -> str:
         return "unknown"
     return result["intent"]
 
-# -------------------------
-# Парсинг «добавить задание» (subject, task, date)
-# -------------------------
-
+#
+# Парсинг "добавить задание"
+#
 async def parse_homework(text: str) -> dict | None:
-    """
-    Извлекает:
-      - subject (предмет) или "" если нет
-      - task (текст задания)
-      - date (DD.MM.YYYY) или "" если не удалось извлечь
-    """
     current_date = datetime.now().strftime("%A, %d.%m.%Y")
 
     prompt = f"""
 Проанализируй текст и извлеки три поля:
-1. subject (название предмета). Если в тексте конкретный предмет не упомянут, ставь "".
+1. subject (название предмета). Если не упомянут, ставь "".
    Не путай слова "задание", "задали" и т.п. с названием предмета.
-2. task (само задание: что нужно сделать).
-3. date (дата в формате DD.MM.YYYY), если упоминается:
-   - Если видишь "завтра"/"послезавтра", вычисли относительно {current_date}.
-   - Если видишь конкретный день недели ("понедельник" и т.д.), вычисли ближайший (но модель может ошибаться).
-   Если дата не упоминается, ставь "".
+2. task (что конкретно задали).
+3. date (DD.MM.YYYY):
+   - Если "завтра"/"послезавтра", вычисли относительно {current_date}.
+   - Если упомянут день недели, попытайся вычислить ближайшую дату.
+   Иначе ставь "".
 
-Ответ **строго** в JSON формате:
+Ответ строго в JSON:
 {{
   "subject": "",
   "task": "",
@@ -137,6 +117,7 @@ async def parse_homework(text: str) -> dict | None:
 
 Текст: {text}
 """
+
     result = await ask_model_for_json(prompt)
     if not result:
         return None
@@ -145,38 +126,30 @@ async def parse_homework(text: str) -> dict | None:
     task = result.get("task", "").strip()
     date_str = result.get("date", "").strip()
 
-    # "Дочистка"
+    # "Дочистка": убрать "задание" и т.п. + нормализовать падеж
     subject, date_str = cleanup_subject_and_date(text, subject, date_str)
 
-    # Если совсем ничего не получилось
     if not (subject or task or date_str):
         return None
 
     return {
-        "subject": subject.capitalize() if subject else "",
+        "subject": subject,
         "task": task,
         "date": date_str
     }
 
-# -------------------------
-# Парсинг «получить задания» (subject, date)
-# -------------------------
-
+#
+# Парсинг "запрос заданий"
+#
 async def parse_homework_request(text: str) -> dict | None:
-    """
-    Извлекает subject (если есть) и date (если есть).
-    Если LLM не найдёт предмет/дату, вернёт "".
-    """
     current_date = datetime.now().strftime("%A, %d.%m.%Y")
 
     prompt = f"""
 Проанализируй текст и извлеки:
-1. subject (название предмета) - если не упомянут в тексте, ставь "".
-   Не путай слова "задание", "задали" с названием предмета.
-2. date (дата в формате DD.MM.YYYY).
-   - Если видишь "завтра"/"послезавтра", вычисли относительно {current_date}.
-   - Если видишь дни недели ("на понедельник", "во вторник" и т.д.), попытайся вычислить ближайшую дату.
-   Если не упоминается дата, ставь "".
+1. subject (название предмета) - если не упомянут, ставь "".
+   Не путай слова "задание", "задали" и т.п. с названием предмета.
+2. date (дата в формате DD.MM.YYYY) - если не упомянута, ставь "".
+   Если есть "завтра"/"послезавтра"/день недели, вычисли относительно {current_date}.
 
 Ответ строго в JSON:
 {{
@@ -194,36 +167,33 @@ async def parse_homework_request(text: str) -> dict | None:
     subject = result.get("subject", "").strip()
     date_str = result.get("date", "").strip()
 
-    # "Дочистка"
+    # "Дочистка": убрать "задание" и т.п. + нормализовать падеж
     subject, date_str = cleanup_subject_and_date(text, subject, date_str)
 
     return {
-        "subject": subject.capitalize() if subject else "",
+        "subject": subject,
         "date": date_str
     }
 
-# -------------------------
-# Логика выборки заданий с учётом «нет даты» / «нет предмета»
-# -------------------------
-
+#
+# Логика выборки
+#
 def get_tasks_by_filter(subject: str | None, date_str: str | None) -> list[str]:
     """
-    Возвращает список заданий в текстовом виде с учётом логики:
-      - если есть subject, но нет date -> вывести все задания по этому предмету, начиная с завтра
-      - если есть date, но нет subject -> вывести все задания на эту дату
-      - если есть и subject, и date -> вывести задания по subject на date
-      - иначе (нет ничего) -> вывести все задания (или ничего, зависит от желаемого поведения)
+    Правила:
+      - Если есть subject, но нет date -> показываем задания по этому предмету, начиная с завтра.
+      - Если есть date, но нет subject -> все задания на указанную дату.
+      - Если есть и subject, и date -> задания для этого предмета и даты.
+      - Если нет ни subject, ни date -> все задания.
     """
-
     results = []
 
-    # Превратим пустые строки в None
-    if subject == "":
+    if not subject:
         subject = None
-    if date_str == "":
+    if not date_str:
         date_str = None
 
-    # вариант: subject + нет date
+    # 1) есть subject, нет date
     if subject and not date_str:
         tomorrow = datetime.now() + timedelta(days=1)
         for d_str, hw_list in homework_storage.items():
@@ -232,20 +202,19 @@ def get_tasks_by_filter(subject: str | None, date_str: str | None) -> list[str]:
             except ValueError:
                 continue
             if dt >= tomorrow:
-                # ищем задания по нужному предмету
                 for hw in hw_list:
                     if hw["subject"].lower() == subject.lower():
                         results.append(f"Дата: {d_str}\nПредмет: {hw['subject']}\nЗадание: {hw['task']}")
         return results
 
-    # вариант: date есть, subject нет
+    # 2) есть date, нет subject
     if date_str and not subject:
         hw_list = homework_storage.get(date_str, [])
         for hw in hw_list:
             results.append(f"Дата: {date_str}\nПредмет: {hw['subject']}\nЗадание: {hw['task']}")
         return results
 
-    # вариант: есть и subject, и date
+    # 3) есть и subject, и date
     if subject and date_str:
         hw_list = homework_storage.get(date_str, [])
         for hw in hw_list:
@@ -253,23 +222,21 @@ def get_tasks_by_filter(subject: str | None, date_str: str | None) -> list[str]:
                 results.append(f"Дата: {date_str}\nПредмет: {hw['subject']}\nЗадание: {hw['task']}")
         return results
 
-    # вариант: нет ни subject, ни date -> покажем все (или вы можете вернуть [] если хотите)
+    # 4) нет ни subject, ни date
     for d_str, hw_list in homework_storage.items():
         for hw in hw_list:
             results.append(f"Дата: {d_str}\nПредмет: {hw['subject']}\nЗадание: {hw['task']}")
-
     return results
 
-# -------------------------
-# Хендлеры Telegram
-# -------------------------
+#
+# Telegram-хендлеры
+#
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Привет! Я бот для управления заданиями.\n\n"
-        "Напиши, что задали, например:\n"
-        "«По математике на завтра упражнения 431, 432»\n"
-        "Или спроси: «Что задали на понедельник?»"
+        "Пример: «По математике на завтра задания 431, 432».\n"
+        "Или спросите: «Что задали на понедельник?»."
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -277,16 +244,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     intent = await parse_query(user_input)
 
     if intent == "add":
-        # Парсим задание (subject, task, date)
         hw = await parse_homework(user_input)
         if not hw:
             await update.message.reply_text("❌ Не удалось распознать задание.")
             return
+
         date = hw["date"]
         subject = hw["subject"]
         task = hw["task"]
 
-        # Добавляем в наше "homework_storage"
+        # Сохраняем
         homework_storage.setdefault(date, []).append(hw)
 
         await update.message.reply_text(
@@ -295,9 +262,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Дата: {date or '(не указана)'}\n"
             f"Задание: {task}"
         )
-
     elif intent == "get":
-        # Парсим запрос (subject, date)
         request_data = await parse_homework_request(user_input)
         if not request_data:
             await update.message.reply_text("❌ Не удалось распознать запрос.")
@@ -310,31 +275,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if tasks:
             await update.message.reply_text("\n\n".join(tasks))
         else:
-            # Выводим сообщение о том, что не нашли
+            # Формируем текст ошибки
             if subject and date_str:
-                await update.message.reply_text(
-                    f"❌ Заданий по предмету '{subject}' на {date_str} не найдено."
-                )
+                await update.message.reply_text(f"❌ Заданий по предмету '{subject}' на {date_str} не найдено.")
             elif subject:
-                await update.message.reply_text(
-                    f"❌ Заданий по предмету '{subject}' не найдено (завтра и далее)."
-                )
+                await update.message.reply_text(f"❌ Заданий по предмету '{subject}' не найдено (завтра и далее).")
             elif date_str:
-                await update.message.reply_text(
-                    f"❌ Заданий на {date_str} не найдено."
-                )
+                await update.message.reply_text(f"❌ Заданий на {date_str} не найдено.")
             else:
                 await update.message.reply_text("❌ Нет заданий.")
     else:
-        # Не удалось определить intent
-        await update.message.reply_text("❌ Я не понял, что вы хотите: добавить задание или посмотреть?")
+        await update.message.reply_text("❌ Не понял, нужно добавить задание или посмотреть имеющиеся?")
 
-# -------------------------
+#
 # Запуск бота
-# -------------------------
+#
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
