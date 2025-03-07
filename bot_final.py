@@ -35,7 +35,7 @@ check_env_vars()
 # -------------------------
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.0-flash-001")
+model = genai.GenerativeModel("gemini-2.0-pro-exp-02-05")
 
 # -------------------------
 # Временное хранилище заданий (в памяти)
